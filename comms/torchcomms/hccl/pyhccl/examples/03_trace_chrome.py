@@ -21,7 +21,7 @@ def main():
     torch_npu.npu.set_device(local)
     dev = torch.device(f"npu:{local}")
 
-    dist.init_process_group(backend="hccl", rank=rank, world_size=world)
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world)
     pg = dist.distributed_c10d._get_default_group()
     set_default_pg(pg)
 

@@ -25,14 +25,17 @@ def main():
     torch_npu.npu.set_device(local_rank)
     dev = torch.device(f"npu:{local_rank}")
 
-    # ---- bootstrap c10d HCCL ----
-    dist.init_process_group(backend="hccl", rank=rank, world_size=world_size)
+    # ---- bootstrap rendezvous (gloo for store only; PyHcclBackend
+    # creates its own HCCL communicator via ctypes) ----
+    dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
     pg = dist.distributed_c10d._get_default_group()
     set_default_pg(pg)
 
     # ---- register torchcomms backend ----
     torchcomms.register_backend("py_hccl", PyHcclBackend)
-    comm = torchcomms.new_comm("py_hccl", dev, name=f"demo_r{rank}")
+    # Name is the comm-group identifier — must be identical across ranks
+    # (it's used as the c10d-store rendezvous key in PyHcclBackend).
+    comm = torchcomms.new_comm("py_hccl", dev, name="demo")
     _check(comm.get_rank() == rank, f"rank mismatch: {comm.get_rank()} != {rank}")
     _check(comm.get_size() == world_size, f"size mismatch")
     _check(comm.get_backend() == "py_hccl", "backend name")
@@ -167,10 +170,16 @@ def main():
     print(f"[rank {rank}] send_recv OK")
 
     # ---- split (re-form a sub-comm with all current ranks; same semantics) ----
-    # TorchComm.split user signature: (ranks, name, hints=None, timeout=None)
-    sub = comm.split(list(range(world_size)), f"sub_r{rank}")
-    _check(sub.get_size() == world_size, f"sub size {sub.get_size()}")
-    print(f"[rank {rank}] split OK")
+    # TorchComm.split user signature: (ranks, name, hints=None, timeout=None).
+    # PyHcclBackend (ctypes variant) skips split because cann 9.0 ships
+    # HcclCreateSubCommConfig as a weak symbol — same status as the native
+    # backend (hccl/README.md split 🟡). Treat NotImplemented as expected.
+    try:
+        sub = comm.split(list(range(world_size)), "sub")
+        _check(sub.get_size() == world_size, f"sub size {sub.get_size()}")
+        print(f"[rank {rank}] split OK")
+    except NotImplementedError as e:
+        print(f"[rank {rank}] split SKIPPED ({e.__class__.__name__})")
 
     comm.finalize()
     dist.destroy_process_group()
