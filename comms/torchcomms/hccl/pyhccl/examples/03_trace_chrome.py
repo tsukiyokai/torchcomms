@@ -2,6 +2,7 @@
 # Output goes to /tmp/torchcomms_trace/ on the remote and is rsync'd to evidence/.
 # Run: torchrun --nproc_per_node=2 trace_dispatch.py
 
+import ctypes
 import os
 import sys
 import torch
@@ -12,6 +13,7 @@ from torch.profiler import profile, ProfilerActivity, record_function
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hccl_pyend import PyHcclBackend, set_default_pg
+import hccl_ffi as ffi
 
 
 def main():
@@ -27,24 +29,34 @@ def main():
 
     torchcomms.register_backend("py_hccl", PyHcclBackend)
     comm = torchcomms.new_comm("py_hccl", dev, name="trace")
+    backend = comm.get_backend_impl()
 
     t = torch.ones(1024, device=dev)
+    hccl_dtype = ffi.torch_dtype_to_hccl(t.dtype)
+
+    def raw_ctypes_allreduce():
+        s = ffi.current_npu_stream()
+        ffi.check(ffi.HcclAllReduce(
+            ctypes.c_void_p(t.data_ptr()), ctypes.c_void_p(t.data_ptr()),
+            t.numel(), hccl_dtype, ffi.HCCL_REDUCE_SUM, backend._comm, s,
+        ), "HcclAllReduce")
+        ffi.acl_check(ffi.aclrtSynchronizeStream(s), "aclrtSynchronizeStream")
 
     # warmup
     for _ in range(20):
         comm.all_reduce(t, torchcomms.ReduceOp.SUM, async_op=False)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        raw_ctypes_allreduce()
 
     out_dir = "/tmp/torchcomms_trace"
     os.makedirs(out_dir, exist_ok=True)
 
     with profile(activities=[ProfilerActivity.CPU], record_shapes=False) as prof:
         for i in range(10):
-            with record_function(f"torchcomms_path"):
+            with record_function("torchcomms_path"):
                 comm.all_reduce(t, torchcomms.ReduceOp.SUM, async_op=False)
         for i in range(10):
-            with record_function(f"c10d_direct_path"):
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            with record_function("raw_ctypes_path"):
+                raw_ctypes_allreduce()
 
     if rank == 0:
         prof.export_chrome_trace(f"{out_dir}/dispatch_trace.json")
