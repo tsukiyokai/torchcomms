@@ -1,13 +1,19 @@
-# bench_dispatch: PyHcclBackend dispatch overhead measurement.
+# bench_dispatch: PyHcclBackend ctypes-direct overhead measurement.
 #
 # Compares per-call host latency between two paths that ultimately hit
-# the same ProcessGroupHCCL underneath:
-#   path A: torchcomms PyHcclBackend (trampoline + PG.allreduce)
-#   path B: dist.all_reduce direct call (PG.allreduce only)
-# Difference ≈ Python trampoline overhead.
+# the same HcclAllReduce on the same comm + stream:
+#   path A: torchcomms.TorchComm.all_reduce
+#           (C++ TorchComm → pybind11 trampoline → PyHcclBackend.all_reduce
+#            → ctypes HcclAllReduce → aclrtSynchronizeStream)
+#   path B: raw ctypes HcclAllReduce + aclrtSynchronizeStream
+#           (skips torchcomms.TorchComm wrapper + trampoline + Python
+#            ReduceOp/dtype conversion)
+# Difference ≈ "torchcomms framework + trampoline" overhead on the
+# ctypes-direct dispatch path.
 #
 # Run: torchrun --nproc_per_node=2 bench_dispatch.py
 
+import ctypes
 import os
 import sys
 import time
@@ -18,6 +24,7 @@ import torchcomms
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from hccl_pyend import PyHcclBackend, set_default_pg
+import hccl_ffi as ffi
 
 WARMUP = 30
 ITER = 300
@@ -53,25 +60,36 @@ def main():
 
     torchcomms.register_backend("py_hccl", PyHcclBackend)
     comm = torchcomms.new_comm("py_hccl", dev, name="bench")
+    backend = comm.get_backend_impl()  # PyHcclBackend instance
 
     shapes = [(4,), (1024,), (1024 * 1024,)]
 
     if rank == 0:
-        header = f"{'shape':>15} {'path':>14} {'p50_us':>10} {'p90_us':>10} {'p99_us':>10}"
+        header = f"{'shape':>15} {'path':>16} {'p50_us':>10} {'p90_us':>10} {'p99_us':>10}"
         bar = "=" * len(header)
-        print(f"\n{bar}\nDispatch overhead bench (sync collective, host-side timing)\n{bar}")
+        print(f"\n{bar}\nctypes-direct dispatch bench (sync collective, host-side timing)\n{bar}")
         print(header)
 
     for shape in shapes:
         t = torch.ones(shape, device=dev)
+        hccl_dtype = ffi.torch_dtype_to_hccl(t.dtype)
+        count = t.numel()
 
-        # Path A: torchcomms PyHcclBackend  (trampoline + PG.allreduce + sync)
+        # Path A: torchcomms.TorchComm.all_reduce (full stack)
         def call_a():
             comm.all_reduce(t, torchcomms.ReduceOp.SUM, async_op=False)
 
-        # Path B: direct c10d  (PG.allreduce + sync)
+        # Path B: raw ctypes HcclAllReduce + sync (no torchcomms framework)
         def call_b():
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            stream = ffi.current_npu_stream()
+            ffi.check(ffi.HcclAllReduce(
+                ctypes.c_void_p(t.data_ptr()),
+                ctypes.c_void_p(t.data_ptr()),
+                count, hccl_dtype, ffi.HCCL_REDUCE_SUM,
+                backend._comm, stream,
+            ), "HcclAllReduce")
+            ffi.acl_check(ffi.aclrtSynchronizeStream(stream),
+                          "aclrtSynchronizeStream")
 
         ns_a = measure(call_a)
         ns_b = measure(call_b)
@@ -79,13 +97,13 @@ def main():
         if rank == 0:
             pa = percentiles_ns(ns_a)
             pb = percentiles_ns(ns_b)
-            print(f"{str(shape):>15} {'torchcomms':>14} "
+            print(f"{str(shape):>15} {'torchcomms':>16} "
                   f"{pa[0] / 1000:>10.2f} {pa[1] / 1000:>10.2f} {pa[2] / 1000:>10.2f}")
-            print(f"{str(shape):>15} {'c10d_direct':>14} "
+            print(f"{str(shape):>15} {'raw_ctypes':>16} "
                   f"{pb[0] / 1000:>10.2f} {pb[1] / 1000:>10.2f} {pb[2] / 1000:>10.2f}")
             delta_p50 = (pa[0] - pb[0]) / 1000.0
             delta_p99 = (pa[2] - pb[2]) / 1000.0
-            print(f"{str(shape):>15} {'overhead':>14} "
+            print(f"{str(shape):>15} {'framework':>16} "
                   f"{delta_p50:>10.2f} {'':>10} {delta_p99:>10.2f}")
 
     comm.finalize()
