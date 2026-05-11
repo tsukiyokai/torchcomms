@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torchcomms
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from py_hccl_backend import PyHcclBackend, set_default_pg
+from hccl_pyend import PyHcclBackend, set_default_pg
 
 
 def _check(cond, msg):
@@ -171,15 +171,11 @@ def main():
 
     # ---- split (re-form a sub-comm with all current ranks; same semantics) ----
     # TorchComm.split user signature: (ranks, name, hints=None, timeout=None).
-    # PyHcclBackend (ctypes variant) skips split because cann 9.0 ships
-    # HcclCreateSubCommConfig as a weak symbol — same status as the native
-    # backend (hccl/README.md split 🟡). Treat NotImplemented as expected.
-    try:
-        sub = comm.split(list(range(world_size)), "sub")
-        _check(sub.get_size() == world_size, f"sub size {sub.get_size()}")
-        print(f"[rank {rank}] split OK")
-    except NotImplementedError as e:
-        print(f"[rank {rank}] split SKIPPED ({e.__class__.__name__})")
+    # cann 9.0 HcclCreateSubCommConfig works via ctypes (probe-verified,
+    # see _probe_split.py); the v0.12 native "hang" was a config-fill issue.
+    sub = comm.split(list(range(world_size)), "sub")
+    _check(sub.get_size() == world_size, f"sub size {sub.get_size()}")
+    print(f"[rank {rank}] split OK")
 
     comm.finalize()
     dist.destroy_process_group()

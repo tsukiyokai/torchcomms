@@ -15,9 +15,9 @@
 #
 # Usage (rank R of N):
 #     import torch, torch.distributed as dist, torch_npu, torchcomms
-#     from py_hccl_backend import PyHcclBackend, set_default_pg
+#     from hccl_pyend import PyHcclBackend, set_default_pg
 #
-#     dist.init_process_group(backend="hccl", rank=R, world_size=N)
+#     dist.init_process_group(backend="gloo", rank=R, world_size=N)
 #     set_default_pg(dist.distributed_c10d._get_default_group())
 #     torchcomms.register_backend("py_hccl", PyHcclBackend)
 #     comm = torchcomms.new_comm("py_hccl", torch.device(f"npu:{R}"), name="demo")
@@ -430,11 +430,45 @@ class PyHcclBackend(TorchCommBackend):
 
     # ---- split ----
     def split(self, ranks, name, options):
-        # HcclCreateSubCommConfig is HCOMM_WEAK_SYMBOL on cann 9.0; native
-        # backend has the same instability (hccl/README.md split status 🟡).
-        # We don't ship split through the ctypes path until cann stabilises.
-        raise NotImplementedError(
-            "PyHcclBackend.split is not implemented in the ctypes-direct "
-            "variant. cann 9.0 ships HcclCreateSubCommConfig as a weak "
-            "symbol with unstable behaviour — see hccl/README.md."
+        # Mirror native TorchCommHCCL::split. HcclCreateSubCommConfig is
+        # HCOMM_WEAK_SYMBOL on cann 9.0 but the ctypes path verified it
+        # callable in ~10ms (see _probe_split.py). The native backend's
+        # v0.12 "hang" was likely a config-fill issue that this Python
+        # path avoids by reproducing HcclCommConfigInit byte-for-byte.
+        if self._rank not in ranks:
+            raise RuntimeError(
+                f"split: current rank {self._rank} not in ranks {ranks}"
+            )
+        my_idx = ranks.index(self._rank)
+        rank_ids = (ctypes.c_uint32 * len(ranks))(*[int(r) for r in ranks])
+        # subCommId must be the same across all participating ranks.
+        sub_comm_id = ctypes.c_uint64(hash(name) & 0xFFFFFFFFFFFFFFFF).value
+
+        cfg = ffi.HcclCommConfig()
+        ffi.hccl_comm_config_init(cfg)
+
+        sub = ffi.HcclComm()
+        ffi.check(
+            ffi.HcclCreateSubCommConfig(
+                ctypes.byref(self._comm),
+                len(ranks),
+                rank_ids,
+                sub_comm_id,
+                my_idx,
+                ctypes.byref(cfg),
+                ctypes.byref(sub),
+            ),
+            "HcclCreateSubCommConfig",
         )
+
+        # Build a PyHcclBackend wrapper around the new sub-comm.
+        child = PyHcclBackend.__new__(PyHcclBackend)
+        TorchCommBackend.__init__(child)
+        child._pg = self._pg
+        child._rank = my_idx
+        child._world_size = len(ranks)
+        child._store = self._store
+        child._device = self._device
+        child._name = name
+        child._comm = sub
+        return child

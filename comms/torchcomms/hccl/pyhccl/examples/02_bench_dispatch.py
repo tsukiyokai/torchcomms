@@ -17,7 +17,7 @@ import torch.distributed as dist
 import torchcomms
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from py_hccl_backend import PyHcclBackend, set_default_pg
+from hccl_pyend import PyHcclBackend, set_default_pg
 
 WARMUP = 30
 ITER = 300

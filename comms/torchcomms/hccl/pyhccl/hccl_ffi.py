@@ -1,6 +1,6 @@
 # ctypes wrappers for libhccl.so + minimal libascendcl.so symbols.
 #
-# Used by py_hccl_backend.py to dispatch collectives directly to HCCL C API,
+# Used by hccl_pyend.py to dispatch collectives directly to HCCL C API,
 # bypassing torch_npu's ProcessGroupHCCL entirely.
 #
 # Verified against cann 9.0 headers:
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import struct
 from typing import Any
 
 import torch
@@ -76,6 +77,75 @@ class HcclSendRecvItem(ctypes.Structure):
         ("dataType", ctypes.c_uint),
         ("remoteRank", ctypes.c_uint32),
     ]
+
+
+# ---- HcclCommConfig (cann 9.0 hccl_types.h HcclCommConfigDef) ----
+# sizeof = 2240 bytes on aarch64. The first 24 bytes are the configInfo_t
+# overlay {size_t size, uint32 magicWord, uint32 version, uint64 reserved}.
+
+_HCCL_COMM_CONFIG_MAGIC_WORD = 0xF0F0F0F0
+_HCCL_COMM_CONFIG_VERSION = 10
+_HCCL_COMM_BUFFSIZE_CONFIG_NOT_SET = 0xFFFFFFFF
+_HCCL_COMM_DETERMINISTIC_CONFIG_NOT_SET = 0xFFFFFFFF
+_HCCL_COMM_TRAFFIC_CLASS_CONFIG_NOT_SET = 0xFFFFFFFF
+_HCCL_COMM_SERVICE_LEVEL_CONFIG_NOT_SET = 0xFFFFFFFF
+_HCCL_COMM_EXECTIMEOUT_CONFIG_NOT_SET = -1  # 0xffffffff cast to int32
+_HCCL_COMM_QOS_CONFIG_NOT_SET = 0xFFFFFFFF
+_HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE = 16
+
+
+class HcclCommConfig(ctypes.Structure):
+    _fields_ = [
+        ("reserved", ctypes.c_char * 24),                # configInfo_t overlay
+        ("hcclBufferSize", ctypes.c_uint32),
+        ("hcclDeterministic", ctypes.c_uint32),
+        ("hcclCommName", ctypes.c_char * 128),
+        ("hcclUdi", ctypes.c_char * 128),
+        ("hcclOpExpansionMode", ctypes.c_uint32),
+        ("hcclRdmaTrafficClass", ctypes.c_uint32),
+        ("hcclRdmaServiceLevel", ctypes.c_uint32),
+        ("hcclWorldRankID", ctypes.c_uint32),
+        ("hcclJobID", ctypes.c_uint64),
+        ("aclGraphZeroCopyEnable", ctypes.c_uint8),
+        # 3 bytes implicit padding for int32 alignment
+        ("hcclExecTimeOut", ctypes.c_int32),
+        ("hcclAlgo", ctypes.c_char * 1600),
+        ("hcclRetryEnable", ctypes.c_char * 50),
+        ("hcclRetryParams", ctypes.c_char * 128),
+        ("hcclBufferName", ctypes.c_char * 128),
+        ("hcclQos", ctypes.c_uint32),
+        # 4 bytes implicit padding for uint64 alignment
+        ("hcclSymWinMaxMemSizePerRank", ctypes.c_uint64),
+    ]
+
+
+def hccl_comm_config_init(cfg: HcclCommConfig) -> None:
+    """Reproduce cann 9.0 hccl_comm.h:197 static inline HcclCommConfigInit."""
+    info_blob = struct.pack(
+        "=QIIQ",
+        ctypes.sizeof(HcclCommConfig),
+        _HCCL_COMM_CONFIG_MAGIC_WORD,
+        _HCCL_COMM_CONFIG_VERSION,
+        0,
+    )
+    ctypes.memmove(ctypes.addressof(cfg), info_blob, 24)
+    cfg.hcclBufferSize = _HCCL_COMM_BUFFSIZE_CONFIG_NOT_SET
+    cfg.hcclDeterministic = _HCCL_COMM_DETERMINISTIC_CONFIG_NOT_SET
+    cfg.hcclCommName = b""
+    cfg.hcclUdi = b""
+    cfg.hcclOpExpansionMode = 0
+    cfg.hcclRdmaTrafficClass = _HCCL_COMM_TRAFFIC_CLASS_CONFIG_NOT_SET
+    cfg.hcclRdmaServiceLevel = _HCCL_COMM_SERVICE_LEVEL_CONFIG_NOT_SET
+    cfg.hcclWorldRankID = 0
+    cfg.hcclJobID = 0
+    cfg.aclGraphZeroCopyEnable = 0
+    cfg.hcclExecTimeOut = _HCCL_COMM_EXECTIMEOUT_CONFIG_NOT_SET
+    cfg.hcclAlgo = b""
+    cfg.hcclRetryEnable = b""
+    cfg.hcclRetryParams = b""
+    cfg.hcclBufferName = b""
+    cfg.hcclQos = _HCCL_COMM_QOS_CONFIG_NOT_SET
+    cfg.hcclSymWinMaxMemSizePerRank = _HCCL_DEFAULT_SYMMETRIC_MEMORY_STRIDE
 
 
 # ---- library handles ----
@@ -149,6 +219,22 @@ HcclGetRankSize = _bind(
 HcclGetCommAsyncError = _bind(
     _libhccl, "HcclGetCommAsyncError",
     [HcclComm, ctypes.POINTER(HcclResult)], HcclResult,
+)
+
+# HcclCreateSubCommConfig is HCOMM_WEAK_SYMBOL on cann 9.0; verified callable
+# from ctypes (see _probe_split.py — sub-comm built in ~10ms with ret=0).
+HcclCreateSubCommConfig = _bind(
+    _libhccl, "HcclCreateSubCommConfig",
+    [
+        ctypes.POINTER(HcclComm),         # parent comm*
+        ctypes.c_uint32,                   # rankNum
+        ctypes.POINTER(ctypes.c_uint32),   # rankIds*
+        ctypes.c_uint64,                   # subCommId
+        ctypes.c_uint32,                   # subCommRankId
+        ctypes.POINTER(HcclCommConfig),    # config*
+        ctypes.POINTER(HcclComm),          # subComm*
+    ],
+    HcclResult,
 )
 
 # ---- collectives (14) ----
