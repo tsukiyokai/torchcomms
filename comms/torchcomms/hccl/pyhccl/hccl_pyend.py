@@ -60,27 +60,54 @@ def set_default_pg(pg):
 # Async work handle
 # ====
 class _StreamSyncWork:
-    """Minimal Work object: wait() drains the stream, is_completed() reports."""
+    """Minimal Work object: wait() drains the stream, is_completed() reports.
+
+    Capture-aware: if the stream is in an active aclmdlRICapture, wait()
+    is a no-op — calling aclrtSynchronizeStream during capture would
+    invalidate the recording (it's a host-side wait, not a graph node).
+    """
 
     def __init__(self, stream):
         self._stream = stream
         self._done = False
 
     def wait(self):
-        if not self._done:
-            ffi.acl_check(ffi.aclrtSynchronizeStream(self._stream),
-                          "aclrtSynchronizeStream")
+        if self._done:
+            return
+        if ffi.stream_is_capturing(self._stream):
             self._done = True
+            return
+        ffi.acl_check(ffi.aclrtSynchronizeStream(self._stream),
+                      "aclrtSynchronizeStream")
+        self._done = True
 
     def is_completed(self):
         return self._done
 
 
 def _maybe_async(stream, async_op):
-    if async_op:
+    """Return a work handle (async) or sync the stream now (sync).
+
+    Capture-aware: if the stream is being captured into an aclmdlRI,
+    sync mode degrades to async — aclrtSynchronizeStream would break the
+    capture. Caller is responsible for ordering when running under capture.
+    """
+    if async_op or ffi.stream_is_capturing(stream):
         return _StreamSyncWork(stream)
     ffi.acl_check(ffi.aclrtSynchronizeStream(stream), "aclrtSynchronizeStream")
     return None
+
+
+def _reject_in_capture(stream, op_name: str, alternative: str) -> None:
+    """Refuse to run an emulation path that does host-side memcpy inside an
+    active aclmdlRICapture — the memcpy cannot be recorded as a graph node
+    and the captured graph would silently produce stale data on replay."""
+    if ffi.stream_is_capturing(stream):
+        raise RuntimeError(
+            f"PyHcclBackend.{op_name} is emulated via host-side copy and "
+            f"cannot be safely captured into an NPUGraph. Use "
+            f"{alternative} (or skip this op in the captured region)."
+        )
 
 
 # ====
@@ -253,13 +280,14 @@ class PyHcclBackend(TorchCommBackend):
         # HCCL writes to a contiguous N*K buffer; copy out into the user's
         # tensor_list after stream sync. List-form is rare — the contig
         # path (all_gather_single) is preferred for hot paths.
+        s = self._stream()
+        _reject_in_capture(s, "all_gather (list form)", "all_gather_single")
         N = self._world_size
         K = tensor.numel()
         assert len(tensor_list) == N, (
             f"all_gather: tensor_list len {len(tensor_list)} != world {N}"
         )
         contig = torch.empty(N * K, dtype=tensor.dtype, device=tensor.device)
-        s = self._stream()
         ffi.check(ffi.HcclAllGather(
             ffi.tensor_void_p(tensor), ffi.tensor_void_p(contig),
             K, self._hccl_dtype(tensor), self._comm, s,
@@ -290,6 +318,9 @@ class PyHcclBackend(TorchCommBackend):
         return _maybe_async(s, async_op)
 
     def reduce_scatter(self, output, input_list, op, async_op):
+        s = self._stream()
+        _reject_in_capture(s, "reduce_scatter (list form)",
+                           "reduce_scatter_single")
         N = self._world_size
         K = output.numel()
         assert len(input_list) == N, (
@@ -298,7 +329,6 @@ class PyHcclBackend(TorchCommBackend):
         contig = torch.empty(N * K, dtype=output.dtype, device=output.device)
         for i in range(N):
             contig[i * K:(i + 1) * K].copy_(input_list[i].reshape(-1))
-        s = self._stream()
         ffi.check(ffi.HcclReduceScatter(
             ffi.tensor_void_p(contig), ffi.tensor_void_p(output),
             K, self._hccl_dtype(output),
@@ -353,6 +383,8 @@ class PyHcclBackend(TorchCommBackend):
         return _maybe_async(s, async_op)
 
     def all_to_all(self, output_tensor_list, input_tensor_list, async_op):
+        s = self._stream()
+        _reject_in_capture(s, "all_to_all (list form)", "all_to_all_single")
         N = self._world_size
         assert len(output_tensor_list) == N and len(input_tensor_list) == N
         # Concatenate into contig, do HcclAlltoAll, split back out
@@ -409,10 +441,11 @@ class PyHcclBackend(TorchCommBackend):
 
     def gather(self, output_list, input, root, async_op):
         # HCCL has no native gather; emulate via allgather + select root.
+        s = self._stream()
+        _reject_in_capture(s, "gather", "all_gather_single + manual root slice")
         N = self._world_size
         K = input.numel()
         contig = torch.empty(N * K, dtype=input.dtype, device=input.device)
-        s = self._stream()
         ffi.check(ffi.HcclAllGather(
             ffi.tensor_void_p(input), ffi.tensor_void_p(contig),
             K, self._hccl_dtype(input), self._comm, s,

@@ -333,6 +333,31 @@ aclrtGetDevice = _bind(
     _libacl, "aclrtGetDevice", [ctypes.POINTER(ctypes.c_int32)], aclError
 )
 
+# ---- aclmdlRICapture (cann 9.0 acl_rt.h:4023+) — for aclgraph support ----
+# HCCL self-supports stream capture (probe-verified, see _probe_capture.py).
+# Backend uses aclmdlRICaptureGetInfo to skip host-side sync inside an
+# active capture so it doesn't break the recording.
+
+ACLMDL_RI_CAPTURE_STATUS_NONE = 0
+ACLMDL_RI_CAPTURE_STATUS_ACTIVE = 1
+ACLMDL_RI_CAPTURE_STATUS_INVALIDATED = 2
+
+aclmdlRI = ctypes.c_void_p
+
+aclmdlRICaptureGetInfo = _bind(
+    _libacl, "aclmdlRICaptureGetInfo",
+    [aclrtStream, ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(aclmdlRI)],
+    aclError,
+)
+
+
+def stream_is_capturing(stream: ctypes.c_void_p) -> bool:
+    """True iff `stream` is in aclmdlRICapture ACTIVE state."""
+    status = ctypes.c_uint(0)
+    ri = aclmdlRI()
+    ret = aclmdlRICaptureGetInfo(stream, ctypes.byref(status), ctypes.byref(ri))
+    return ret == 0 and status.value == ACLMDL_RI_CAPTURE_STATUS_ACTIVE
+
 
 # ---- error helpers ----
 
