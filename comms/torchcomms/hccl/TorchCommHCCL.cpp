@@ -9,12 +9,14 @@
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include <torch/csrc/distributed/c10d/Store.hpp>
 
 #include "comms/torchcomms/TorchCommFactory.hpp"
 #include "comms/torchcomms/hccl/TorchCommHCCLUtils.hpp"
+#include "comms/torchcomms/hccl/TorchCommWindowHCCL.hpp"
 #include "comms/torchcomms/hccl/TorchWorkHCCL.hpp"
 
 namespace torch::comms {
@@ -505,6 +507,106 @@ void TorchCommHCCL::setSubComm(HcclComm sub_comm, int rank, int size,
   device_ = device;
   comm_name_ = name;
   initialized_.store(true);
+}
+
+// ---- one-sided window (HIXL) ----
+
+void TorchCommHCCL::initHixlOnce() {
+  if (!options_.store) {
+    throw std::runtime_error(
+        "TorchCommHCCL::new_window: HIXL needs CommOptions.store. Pass "
+        "store=... to torchcomms.new_comm or set up via "
+        "torch.distributed.init_process_group first.");
+  }
+
+  hixl_api_ = std::make_shared<DefaultHixlApi>();
+
+  std::string host_ip = "127.0.0.1";
+  int base_port = 50000;
+  auto it = options_.hints.find("hixl_host_ip");
+  if (it != options_.hints.end()) host_ip = it->second;
+  it = options_.hints.find("hixl_base_port");
+  if (it != options_.hints.end()) base_port = std::stoi(it->second);
+
+  std::string self_engine =
+      host_ip + ":" + std::to_string(base_port + rank_);
+
+  // hixl::Initialize switches to its own aclrtContext (verified via debug
+  // log: "Switch new aclrt ctx:0x..."). The torch_npu acl context that
+  // our caller's tensors live in must be restored afterwards — otherwise
+  // register/transfer of torch tensor data_ptr fails the cross-context
+  // visibility check (TransferSync hangs until TIMEOUT).
+  aclrtContext saved_ctx = nullptr;
+  (void)aclrtGetCurrentContext(&saved_ctx);
+  HIXL_CHECK(hixl_api_, hixl_api_->initialize(self_engine, {}),
+             "TorchCommHCCL::initHixlOnce: hixl::Initialize");
+  if (saved_ctx != nullptr) {
+    (void)aclrtSetCurrentContext(saved_ctx);
+  }
+
+  // Rendezvous engine strings via c10d::Store. Each rank publishes its own
+  // engine string under a per-rank key, then waits for & reads the others.
+  const std::string key_prefix =
+      "hccl_hixl_engine_" + comm_name_ + "_";
+  auto own_key = key_prefix + std::to_string(rank_);
+  std::vector<uint8_t> own_bytes(self_engine.begin(), self_engine.end());
+  options_.store->set(own_key, own_bytes);
+
+  std::vector<std::string> peer_keys;
+  peer_keys.reserve(size_ - 1);
+  for (int i = 0; i < size_; ++i) {
+    if (i != rank_) peer_keys.push_back(key_prefix + std::to_string(i));
+  }
+  if (!peer_keys.empty()) {
+    options_.store->wait(peer_keys, std::chrono::milliseconds(60000));
+  }
+
+  peer_engines_.resize(size_);
+  for (int i = 0; i < size_; ++i) {
+    if (i == rank_) {
+      peer_engines_[i] = self_engine;
+      continue;
+    }
+    auto bytes = options_.store->get(key_prefix + std::to_string(i));
+    peer_engines_[i] = std::string(bytes.begin(), bytes.end());
+  }
+
+  // Listener-ready barrier: hixl::Initialize on each rank starts the
+  // RaSocket server (port 16666 on phyId NPU-IP) asynchronously; Connect
+  // before the peer's RaSocketListenStart completes returns TIMEOUT.
+  // Demo (server_server_d2d.cpp:193) sleeps 5s and works; 2s wasn't
+  // enough in the backend path here. Match demo and post a "ready" key
+  // so all ranks observe each other's listeners before any Connect.
+  std::this_thread::sleep_for(std::chrono::seconds(5));
+  const std::string ready_prefix =
+      "hccl_hixl_ready_" + comm_name_ + "_";
+  options_.store->set(ready_prefix + std::to_string(rank_),
+                       std::vector<uint8_t>{1});
+  std::vector<std::string> ready_keys;
+  ready_keys.reserve(size_);
+  for (int i = 0; i < size_; ++i) {
+    ready_keys.push_back(ready_prefix + std::to_string(i));
+  }
+  options_.store->wait(ready_keys, std::chrono::milliseconds(60000));
+}
+
+std::shared_ptr<TorchCommWindow> TorchCommHCCL::new_window(
+    const std::optional<at::Tensor>& tensor) {
+  ensureInitialized("new_window");
+  std::call_once(hixl_init_flag_, [this]() { initHixlOnce(); });
+
+  // Each window gets a unique name so its store-rendezvous keys (used in
+  // TorchCommWindowHCCL::tensor_register for addr exchange) don't collide
+  // across multiple windows on the same comm.
+  std::string win_name =
+      comm_name_ + "_win" + std::to_string(next_window_id_++);
+
+  auto window = std::make_shared<TorchCommWindowHCCL>(
+      hixl_api_, rank_, size_, peer_engines_, options_.store, win_name);
+  if (tensor.has_value()) {
+    window->tensor_register(tensor.value());
+  }
+  return window;
 }
 
 // ---- Backend factory registration ----

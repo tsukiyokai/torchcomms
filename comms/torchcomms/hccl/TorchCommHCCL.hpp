@@ -9,16 +9,21 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <ATen/ATen.h>
 
 #include "comms/torchcomms/TorchComm.hpp"
 #include "comms/torchcomms/TorchCommBackend.hpp"
 #include "comms/torchcomms/TorchCommBatch.hpp"
+#include "comms/torchcomms/TorchCommWindow.hpp"
 #include "comms/torchcomms/device/npu/NpuApi.hpp"
 #include "comms/torchcomms/hccl/HcclApi.hpp"
+#include "comms/torchcomms/hccl/HixlApi.hpp"
 
 namespace torch::comms {
 
@@ -100,12 +105,19 @@ class TorchCommHCCL : public TorchCommBackend,
                                            const std::string& name,
                                            const CommOptions& options) override;
 
+  // ---- one-sided window (HIXL-backed) ----
+  std::shared_ptr<TorchCommWindow> new_window(
+      const std::optional<at::Tensor>& tensor = std::nullopt) override;
+
  private:
   c10::intrusive_ptr<TorchWork> makeWork(aclrtStream stream, bool async_op);
   void ensureInitialized(const char* op) const;
   // Used by split() to install a sub-comm into a freshly-constructed sibling.
   void setSubComm(HcclComm sub_comm, int rank, int size, at::Device device,
                    const std::string& name);
+  // Lazy: instantiate HixlApi + Initialize + rendezvous engine strings via
+  // c10d store on the first new_window() call.
+  void initHixlOnce();
 
   std::unique_ptr<NpuApi> npu_api_;
   std::unique_ptr<HcclApi> hccl_api_;
@@ -116,6 +128,12 @@ class TorchCommHCCL : public TorchCommBackend,
   int rank_{0};
   int size_{0};
   std::atomic<bool> initialized_{false};
+
+  // HIXL one-sided state (populated on first new_window).
+  std::shared_ptr<HixlApi> hixl_api_;
+  std::vector<std::string> peer_engines_;
+  std::once_flag hixl_init_flag_;
+  int next_window_id_{0};
 };
 
 }  // namespace torch::comms

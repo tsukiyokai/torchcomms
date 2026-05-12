@@ -25,6 +25,11 @@ set(HCCL_INCLUDE "${CANN_HOME}/include")
 set(HCCL_LIB_DIR "${CANN_HOME}/lib64")
 set(HCCL_SHARED_LIB "${HCCL_LIB_DIR}/libhccl.so")
 set(ACL_SHARED_LIB "${HCCL_LIB_DIR}/libascendcl.so")
+# HIXL (Huawei Xfer Library): one-sided put/signal/notify backend.
+# Headers in ${HCCL_INCLUDE}/hixl/, types depend on ge::AscendString from
+# ${HCCL_INCLUDE}/external/ge_common/, runtime in libcann_hixl + libmetadef.
+set(HIXL_SHARED_LIB "${HCCL_LIB_DIR}/libcann_hixl.so")
+set(METADEF_SHARED_LIB "${HCCL_LIB_DIR}/libmetadef.so")
 
 # Locate torch_npu (for c10_npu::NPUGuard / getCurrentNPUStream).
 # This is the only place we link torch_npu.
@@ -57,6 +62,7 @@ set_target_properties(torchcomms_comms_hccl PROPERTIES
 target_include_directories(torchcomms_comms_hccl PRIVATE
     ${ROOT}
     ${HCCL_INCLUDE}
+    ${HCCL_INCLUDE}/external      # ge_api_error_codes.h for HIXL types
     ${TORCH_NPU_INCLUDE}
     ${Python3_INCLUDE_DIRS}
 )
@@ -69,5 +75,7 @@ target_link_libraries(torchcomms_comms_hccl PRIVATE
     ${TORCH_PYTHON_LIB}
     ${HCCL_SHARED_LIB}
     ${ACL_SHARED_LIB}
+    ${HIXL_SHARED_LIB}
+    ${METADEF_SHARED_LIB}
     ${TORCH_NPU_LIB}
 )
