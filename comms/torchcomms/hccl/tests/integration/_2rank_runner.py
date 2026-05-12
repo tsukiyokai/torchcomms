@@ -222,6 +222,33 @@ def cmd_aclgraph_multi():
     teardown(comm)
 
 
+def cmd_window_put():
+    rank, world, dev, comm = setup()
+    K = 16
+    # win_buf is the registered buffer; HIXL requires both source and
+    # destination addresses to come from registered memory, so we put
+    # *from* the registered buffer (rank 0 fills it locally first) *to*
+    # the peer's registered win_buf.
+    win_buf = torch.zeros(K, device=dev, dtype=torch.float32)
+    torch_npu.npu.synchronize()
+    win = comm.new_window(win_buf)
+
+    if rank == 0:
+        win_buf.fill_(7.0)
+        torch_npu.npu.synchronize()
+        win.put(win_buf, dst_rank=1, target_offset_nelems=0,
+                 async_op=False).wait()
+        win.signal(peer_rank=1, async_op=False).wait()
+    else:
+        win.wait_signal(peer_rank=0, async_op=False).wait()
+        expected = torch.full((K,), 7.0)
+        assert torch.allclose(win_buf.cpu(), expected), \
+            f"window_put: rank {rank} got {win_buf.cpu()}"
+
+    win.tensor_deregister()
+    teardown(comm)
+
+
 COMMANDS = {
     "all_reduce": cmd_all_reduce,
     "broadcast": cmd_broadcast,
@@ -234,6 +261,7 @@ COMMANDS = {
     "split": cmd_split,
     "aclgraph_single": cmd_aclgraph_single,
     "aclgraph_multi": cmd_aclgraph_multi,
+    "window_put": cmd_window_put,
 }
 
 
